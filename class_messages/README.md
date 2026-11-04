@@ -1,73 +1,133 @@
-# Student Placement Prediction
+# Local-LLM Class Task Extractor
 
-A machine learning pipeline that predicts whether a registered student will receive a campus placement offer (`placed = 1`) or not (`placed = 0`). The model is optimized for the **F1 score on the positive class**, and ships with a fully self-contained batch inference script.
+Reads a folder of short class/project-week messages and writes one JSON task list. Inference runs **entirely locally** through [Ollama](https://ollama.ai/) with `qwen2.5:1.5b`. No messages are sent to a hosted API.
 
-## Results at a Glance
+Built for a low-resource machine (CPU only, 4 threads, ~8 GB RAM), so most of the work is done in Python and the small model only makes narrow decisions.
 
-| Metric (5-fold stratified CV, out-of-fold) | Value |
-| :--- | :---: |
-| F1 (placed = 1) | **0.9251** |
-| ROC-AUC | **0.9755** |
-| Precision / Recall | 0.9270 / 0.9231 |
-| Accuracy | 0.9580 |
-| Decision threshold | 0.485 |
+## Quick Start
 
-The `status_code`-only baseline heuristic scores F1 = 0.9201. The final model improves on it by resolving the cases where `status_code` disagrees with the outcome.
+```bash
+# 1. Start Ollama and pull the model
+ollama serve
+ollama pull qwen2.5:1.5b
 
-## Repository Structure
+# 2. Install dependencies (Python 3.10+)
+pip install -r requirements.txt
+
+# 3. Run
+python extract.py --inbox messages --output tasks.json
+```
+
+## Input and Output
+
+Each message is a `.txt` file with a header, a blank line, then the body:
+
+```text
+message_id: ex01
+from: Class mentor
+date: 1 Mar 2024
+
+Riya, please share the venue list by Tuesday 11am.
+```
+
+Output (`tasks.json`):
+
+```json
+{
+  "tasks": [
+    {
+      "message_id": "ex01",
+      "task": "Share the venue list",
+      "owner": "Riya",
+      "due": "Tuesday 11am"
+    }
+  ]
+}
+```
+
+- `task`: short line describing what to do
+- `owner`: the person asked to do it, or `null`
+- `due`: the deadline in the message's own words, or `null`
+- Messages that do not ask for a task are left out
+- Tasks are sorted by natural message ID order (`m2` before `m10`)
+
+## How It Works
+
+Two passes keep the 1.5B model accurate:
+
+1. **Pass A, classify:** the model returns `task` or `no_task`. Chatter, FYIs, social invites, cancellations, and questions exit early.
+2. **Pass B, extract:** runs only for actionable messages. Python first extracts candidate deadlines with regex, and the model may only pick one of those or `null`.
+
+```text
+Message -> parse header -> injection filter -> Pass A (classify)
+        -> candidate deadlines (regex) -> Pass B (extract)
+        -> grounding checks -> Pydantic validation -> atomic JSON write
+```
+
+Header fields (`from`, `date`) are deliberately **not** sent to the model. The sender is not necessarily the task owner, and header dates invite hallucinated deadlines.
+
+### Due-date rule
+
+`due` is set only when the message frames the time as a deadline (`by`, `before`, `until`, `within N days`, `end of day`, `tomorrow`, or `on <date>` alongside a delivery verb such as submit/send/share). Event times are not deadlines: in "Book the hall for the demo on 18 March at 10am", `due` is `null`.
+
+## Guardrails (Prompt Injection)
+
+Messages are treated as untrusted input, with three layers of defense:
+
+1. **Regex pre-filter:** strips generic directives such as "ignore previous instructions", "system prompt", "you are now", and "act as". It is topic-agnostic, so legitimate tasks like "share the answer key" are not blocked.
+2. **Prompt isolation:** the body is wrapped in `<message>...</message>`, and the system prompt says enclosed text is untrusted.
+3. **Output grounding in Python:**
+   - Owner must appear as a whole word in the message, and generic words (someone, everyone, nobody, I) become `null`
+   - Due must exactly match a regex-extracted candidate, otherwise `null`
+   - Tasks containing an email address not present in the message are dropped
+   - Duplicate tasks are collapsed by (core words, owner)
+
+## Determinism
+
+Every request uses `temperature: 0`, `top_k: 1`, `seed: 42`, fixed context and thread settings, and a JSON-schema `format` constraint. Two runs on the practice folder produced byte-identical output:
+
+```text
+SHA-256 (run 1): EABAF170431819D5F5D8B3C801BC8CE228C3B879FE1A4E6F1E0C47FA1C251965
+SHA-256 (run 2): EABAF170431819D5F5D8B3C801BC8CE228C3B879FE1A4E6F1E0C47FA1C251965
+fc.exe /b: no differences encountered
+```
+
+## Error Handling
+
+| Situation | Behavior |
+| :--- | :--- |
+| Ollama unreachable or model missing | Message on stderr, writes `{"tasks": []}`, exits with code 1 |
+| LLM call fails or times out (120 s) | Retries once, then skips that message and continues |
+| Non-`.txt` file, binary file (null bytes), empty body | Skipped and logged to stderr |
+| Body over 4,000 characters | Truncated and logged |
+| Missing `message_id` header | Falls back to the filename stem |
+| Output write | Written to a temp file, then `os.replace` for an atomic commit |
+
+## Token Usage (practice folder, cold run)
+
+Counted from Ollama's `prompt_eval_count` and `eval_count`, summed over all calls and printed to stderr:
+
+```text
+Tokens: 3845 prompt, 174 completion, 4019 total
+```
+
+About 58.5 s for 6 messages (~9.75 s per message) on 4 CPU threads.
+
+## Project Structure
 
 ```text
 .
-├── analysis.ipynb        # EDA, feature engineering, model comparison, threshold tuning
-├── predict.py            # Standalone batch inference script (model embedded)
-├── requirements.txt      # Python dependencies
-├── README.md             # This file
-└── data/
-    ├── train.csv             # Training data (2,500 students)
-    └── sample_submission.csv # Expected output layout
+├── extract.py        # Extractor
+├── NOTES.md          # Implementation notes
+├── requirements.txt  # pydantic
+├── messages/         # Practice messages
+└── example/          # One solved message + expected.json
 ```
 
-## Dataset
+## Configuration and Limitations
 
-Each row is one student who registered with the placement cell.
-
-| Column | Description |
-| --- | --- |
-| `student_id` | Student identifier |
-| `department` | CSE, IT, ECE, EEE, MECH, or CIVIL |
-| `city_tier` | 1, 2, or 3 |
-| `cgpa` | Cumulative GPA |
-| `backlogs` | Active backlogs |
-| `internship_months` | Internship length in months |
-| `coding_score` | Internal coding test score (0-100) |
-| `projects` | Number of projects listed |
-| `workshops` | Number of workshops attended |
-| `status_code` | Field stored on the placement portal |
-| `placed` | Target: 1 if placed, 0 otherwise (train only) |
-
-**Key data facts**
-- Class imbalance: 702 placed (28.08%) vs. 1,798 unplaced (71.92%).
-- Missing values: `coding_score` (21.0%), `backlogs` (6.7%), `cgpa` (4.7%), `status_code` (4.5%).
-- `status_code` is highly predictive but not perfect: `0` is 98.0% unplaced (33 exceptions), `1` is 92.1% placed (55 exceptions), and missing is 21.2% placed.
-- Placement rates vary by department, from 38.4% (CSE) down to 13.6% (CIVIL).
-
-## Approach
-
-**Feature engineering**
-- Missingness indicators: `cgpa_missing`, `coding_score_missing`, `backlogs_missing`, `status_code_missing`
-- `cgpa_backlog_ratio` = cgpa / (backlogs + 1)
-- `coding_per_cgpa` = coding_score / (cgpa + 0.1)
-- `practical_score` = 2.0 × internship_months + 1.5 × projects + 0.5 × workshops
-- `tech_composite` = coding_score / 10 + 1.5 × cgpa + 1.5 × internship_months
-- `dept_tier`: ordinal department ranking (CSE=5 ... CIVIL=0), plus one-hot department
-- `status_code` filled with a `-1` sentinel when missing
-
-**Preprocessing:** median imputation, standard scaling, and one-hot encoding with `handle_unknown='ignore'`, all fitted inside each CV fold to avoid leakage.
-
-**Models compared** (5-fold stratified CV, out-of-fold predictions):
-
-| Model | ROC-AUC | Optimal F1 |
-| :--- | :---: | :---: |
-| Weighted blend (LR + XGB + LGB) | 0.9751 | 0.9256 |
-| **Logistic Regression (C=0.1)** | **0.9755** | 0.9251 |
-|
+- The model name, `num_gpu: 0`, and `num_thread: 4` are hardcoded in `extract.py`. Edit them for a different machine.
+- Set `OLLAMA_HOST` to use a non-default Ollama address (default `http://localhost:11434`).
+- At most 5 tasks are kept per message.
+- The injection filter is regex-based and removes the matched text through the end of the line, so unusual phrasing in a legitimate message could be trimmed.
+- Deadline detection is regex-based, so phrasings outside the supported cues yield `due: null` rather than a guess. This is deliberate: it favors no deadline over an invented one.
