@@ -1,4 +1,4 @@
-GoML Assessment Submissions
+## GoML Assessment Submissions
 
 This repository holds my submissions for two take-home cases from the GoML evaluation. Each case is a self-contained project in its own folder, with its own README, code, and notes.
 
